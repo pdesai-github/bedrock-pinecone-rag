@@ -65,11 +65,6 @@ def invoke_llm(prompt):
         print(f"Error invoking LLM: {str(e)}")
         return None
 
-import time
-
-# Wait for index to be ready
-time.sleep(1)
-
 # Define the documents with their IDs
 docs_data = [
     {
@@ -92,70 +87,86 @@ docs_data = [
 # Get the index instance
 index = pc.Index(index_name)
 
-# Check and add documents one by one
+def upsert_document(doc, namespace="employee_data"):
+    """Helper function to upsert a single document to Pinecone"""
+    # Get embeddings for the text
+    embedded_text = get_embedding(doc["text"])
+    if not embedded_text:
+        return False, "Failed to generate embedding"
+    
+    # Create the vector with metadata
+    vector = {
+        'id': doc["id"],
+        'values': embedded_text,
+        'metadata': {**doc["metadata"], 'text': doc["text"]}
+    }
+    
+    # Upsert to Pinecone
+    index.upsert(vectors=[vector], namespace=namespace)
+    return True, "Document added successfully"
+
+# Process all documents
 for doc in docs_data:
     try:
         # Check if document exists
-        existing_doc = index.fetch(
-            ids=[doc["id"]],
-            namespace="employee_data"
-        )
+        existing = index.fetch(ids=[doc["id"]], namespace="employee_data")
         
-        # Check if the document exists using the vectors property of FetchResponse
-        if not hasattr(existing_doc, 'vectors') or doc["id"] not in existing_doc.vectors:
-            # Get embeddings for the text
-            embedded_text = get_embedding(doc["text"])
-            
-            if embedded_text:
-                # Upsert to Pinecone
-                index.upsert(
-                    vectors=[{
-                        'id': doc["id"],
-                        'values': embedded_text,
-                        'metadata': {
-                            **doc["metadata"],
-                            'text': doc["text"]  # Store the original text in metadata
-                        }
-                    }],
-                    namespace="employee_data"
-                )
-                print(f"Added document with ID: {doc['id']}")
-            else:
-                print(f"Failed to get embedding for document {doc['id']}")
+        if not hasattr(existing, 'vectors') or doc["id"] not in existing.vectors:
+            success, message = upsert_document(doc)
+            print(f"Document {doc['id']}: {message}")
         else:
-            print(f"Document with ID {doc['id']} already exists, skipping.")
+            print(f"Document {doc['id']} already exists, skipping.")
     except Exception as e:
-        print(f"Error checking/adding document {doc['id']}: {str(e)}")
+        print(f"Error processing document {doc['id']}: {str(e)}")
 
-def generate_response(query):
-    # Get embeddings for the query
+def create_qa_prompt(context, query):
+    """
+    Creates a prompt template for question answering using provided context.
+
+    Args:
+        context (str): The relevant context/information to answer the question
+        query (str): The question that needs to be answered
+
+    Returns:
+        str: A formatted prompt combining the context and query for the LLM
+    """
+    # Define the template as a multi-line formatted string
+    prompt_template = f"""Based on the following information, please answer the question.                
+        Information: {context}
+        Question: {query}
+        Please extract and state the exact information from the provided context to answer the question in a clear and concise manner."""
+    
+    return prompt_template
+
+def search_relevant_context(query, namespace="employee_data"):
+    """Search for relevant context in the vector store"""
     query_embedding = get_embedding(query)
-    
     if not query_embedding:
-        return "Failed to process query"
+        return None
     
-    # Search in Pinecone using the index
     search_results = index.query(
         vector=query_embedding,
         top_k=1,
-        namespace="employee_data",
+        namespace=namespace,
         include_metadata=True
     )
     
-    # Extract the content from the most relevant document
     if hasattr(search_results, 'matches') and search_results.matches:
-        context = search_results.matches[0].metadata['text']
-        prompt = f"""Based on the following information, please answer the question.
-        
-Information: {context}
+        return search_results.matches[0].metadata['text']
+    return None
 
-Question: {query}
-
-Please extract and state the exact information from the provided context to answer the question."""
-        
-        response = invoke_llm(prompt)
-        return response if response else "Failed to generate response"
-    return "No relevant information found."
+def generate_response(query):
+    """Generate a response for the given query using RAG pattern"""
+    # Search for relevant context
+    context = search_relevant_context(query)
+    if not context:
+        return "No relevant information found."
+    
+    # Generate prompt and get response
+    prompt = create_qa_prompt(context, query)
+    response = invoke_llm(prompt)
+    
+    return response if response else "Failed to generate response"
 
 # Example usage
 query = "Pradip's total loans amounts?"
