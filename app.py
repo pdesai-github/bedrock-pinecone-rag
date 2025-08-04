@@ -1,10 +1,11 @@
-from pinecone import Pinecone, ServerlessSpec
+from pinecone import Pinecone
+import boto3
+import json
 from dotenv import load_dotenv
 load_dotenv()
 import os
-from langchain_aws import BedrockLLM
-from langchain_aws.embeddings import BedrockEmbeddings
 
+# Initialize Pinecone
 pc = Pinecone(api_key=os.environ['PINECONE_API_KEY'])
 
 index_name = "developer-quickstart-py"
@@ -21,25 +22,50 @@ if not pc.has_index(index_name):
     )
 print('index created or skipped')
 
-llm = BedrockLLM(
-    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
-    aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
+# Initialize boto3 client for Amazon Bedrock
+bedrock = boto3.client(
+    service_name='bedrock-runtime',
     region_name=os.environ['AWS_REGION'],
-    model_id="amazon.titan-text-express-v1"
+    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
+    aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY']
 )
 
-# res = llm.invoke(input="What is the recipe of mayonnaise?")
-# print(res)
+def get_embedding(text):
+    """Get embeddings using Amazon Titan embedding model"""
+    try:
+        response = bedrock.invoke_model(
+            modelId="amazon.titan-embed-text-v2:0",
+            body=json.dumps({"inputText": text})
+        )
+        response_body = json.loads(response.get('body').read())
+        return response_body.get('embedding')
+    except Exception as e:
+        print(f"Error getting embedding: {str(e)}")
+        return None
+
+def invoke_llm(prompt):
+    """Invoke Bedrock LLM using Titan model"""
+    try:
+        body = json.dumps({
+            "inputText": prompt,
+            "textGenerationConfig": {
+                "maxTokenCount": 512,
+                "temperature": 0,
+                "topP": 1,
+            }
+        })
+        
+        response = bedrock.invoke_model(
+            modelId="amazon.titan-text-express-v1",
+            body=body
+        )
+        response_body = json.loads(response.get('body').read())
+        return response_body.get('results')[0].get('outputText')
+    except Exception as e:
+        print(f"Error invoking LLM: {str(e)}")
+        return None
 
 import time
-
-# Initialize the Bedrock embeddings model
-embeddings = BedrockEmbeddings(
-    aws_access_key_id=os.environ['AWS_ACCESS_KEY_ID'],
-    aws_secret_access_key=os.environ['AWS_SECRET_ACCESS_KEY'],
-    region_name=os.environ['AWS_REGION'],
-    model_id="amazon.titan-embed-text-v2:0"
-)
 
 # Wait for index to be ready
 time.sleep(1)
@@ -78,39 +104,35 @@ for doc in docs_data:
         # Check if the document exists using the vectors property of FetchResponse
         if not hasattr(existing_doc, 'vectors') or doc["id"] not in existing_doc.vectors:
             # Get embeddings for the text
-            embedded_text = embeddings.embed_query(doc["text"])
+            embedded_text = get_embedding(doc["text"])
             
-            # Upsert to Pinecone
-            index.upsert(
-                vectors=[{
-                    'id': doc["id"],
-                    'values': embedded_text,
-                    'metadata': {
-                        **doc["metadata"],
-                        'text': doc["text"]  # Store the original text in metadata
-                    }
-                }],
-                namespace="employee_data"
-            )
-            print(f"Added document with ID: {doc['id']}")
+            if embedded_text:
+                # Upsert to Pinecone
+                index.upsert(
+                    vectors=[{
+                        'id': doc["id"],
+                        'values': embedded_text,
+                        'metadata': {
+                            **doc["metadata"],
+                            'text': doc["text"]  # Store the original text in metadata
+                        }
+                    }],
+                    namespace="employee_data"
+                )
+                print(f"Added document with ID: {doc['id']}")
+            else:
+                print(f"Failed to get embedding for document {doc['id']}")
         else:
             print(f"Document with ID {doc['id']} already exists, skipping.")
     except Exception as e:
         print(f"Error checking/adding document {doc['id']}: {str(e)}")
 
-
-from langchain_core.prompts import PromptTemplate
-prompt = PromptTemplate(
-    template="""Based on the following information, please answer the question.
-    Information: {context}
-    Question: {query}
-    Please extract and state the exact information from the provided context to answer the question.
-    """,
-        input_variables=["context", "query"]
-    )
 def generate_response(query):
     # Get embeddings for the query
-    query_embedding = embeddings.embed_query(query)
+    query_embedding = get_embedding(query)
+    
+    if not query_embedding:
+        return "Failed to process query"
     
     # Search in Pinecone using the index
     search_results = index.query(
@@ -123,13 +145,20 @@ def generate_response(query):
     # Extract the content from the most relevant document
     if hasattr(search_results, 'matches') and search_results.matches:
         context = search_results.matches[0].metadata['text']
-        prompt_text = prompt.format(context=context, query=query)
-        response = llm.invoke(input=prompt_text)
-        return response
+        prompt = f"""Based on the following information, please answer the question.
+        
+Information: {context}
+
+Question: {query}
+
+Please extract and state the exact information from the provided context to answer the question."""
+        
+        response = invoke_llm(prompt)
+        return response if response else "Failed to generate response"
     return "No relevant information found."
 
 # Example usage
-query = "What is Pradip's total loans amounts?"
+query = "Pradip's total loans amounts?"
 response = generate_response(query)
 print(f"Query: {query}")
 print(f"Response: {response}")
